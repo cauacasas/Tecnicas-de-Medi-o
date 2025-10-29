@@ -1,0 +1,196 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <math.h>
+
+// --- Configurações do Display OLED ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// --- Pinos dos Sensores ---
+#define VOLTAGE_PIN A0   // ZMPT101B
+#define CURRENT_PIN A1   // SCT-013 50A/1V
+
+// --- Calibrações ---
+const float V_CAL = 269.0;
+const float I_CAL = 39.5;  // Calibrado (0.88A / 1.01A)
+
+// --- Parâmetros de amostragem ---
+const float VREF = 5.0;
+const int ADC_RESOLUTION = 1024;
+const int GRID_FREQUENCY = 60;
+const int CYCLES_TO_SAMPLE = 20;
+const int AVG_SAMPLES = 5;
+
+// --- Variáveis globais ---
+float vHistory[AVG_SAMPLES], iHistory[AVG_SAMPLES], pHistory[AVG_SAMPLES];
+float vSum = 0.0, iSum = 0.0, pSum = 0.0;
+int avgIndex = 0;
+bool filterPrimed = false;
+
+// --- Filtros adaptativos ---
+static double vOffset = ADC_RESOLUTION / 2.0;
+static double iOffset = ADC_RESOLUTION / 2.0;
+
+// --- Protótipos ---
+void displayResults(float v, float i, float p_act, float p_app, float p_react, float pf);
+void printToSerial(float v, float i, float p_act, float p_app, float p_react, float pf);
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin();
+  delay(250);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("Falha ao iniciar display SSD1306 (0x3C)"));
+    for (;;);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("Analisador de Energia"));
+  display.println(F("Inicializando..."));
+  display.display();
+  delay(2000);
+}
+
+void loop() {
+  double sum_v = 0.0, sum_i = 0.0, sum_inst_power = 0.0;
+  long startTime = millis();
+  int count = 0;
+
+  // --- Amostragem de múltiplos ciclos da rede ---
+  while (millis() - startTime < (1000.0 / GRID_FREQUENCY) * CYCLES_TO_SAMPLE) {
+    float v_sample = analogRead(VOLTAGE_PIN);
+    float i_sample = analogRead(CURRENT_PIN);
+
+    // --- Offset adaptativo (suavizado) ---
+    double v_offset_removed = v_sample - vOffset;
+    double i_offset_removed = i_sample - iOffset;
+
+    vOffset = 0.999 * vOffset + 0.001 * v_sample;
+    iOffset = 0.999 * iOffset + 0.001 * i_sample;
+
+    // --- Acúmulo de energia instantânea ---
+    sum_v += v_offset_removed * v_offset_removed;
+    sum_i += i_offset_removed * i_offset_removed;
+    sum_inst_power += v_offset_removed * i_offset_removed;
+
+    count++;
+  }
+
+  if (count == 0) return;
+
+  // --- Cálculo RMS ---
+  double v_rms_raw = sqrt(sum_v / count);
+  double i_rms_raw = sqrt(sum_i / count);
+
+  float rawVoltage = (v_rms_raw / ADC_RESOLUTION) * VREF * V_CAL;
+  float rawCurrent = (i_rms_raw / ADC_RESOLUTION) * VREF * I_CAL;
+
+  // --- Potência ativa (corrigida) ---
+  // Esta linha de correção é importante
+  double mean_inst_power = (sum_inst_power / count) - ((vOffset - (ADC_RESOLUTION / 2.0)) * (iOffset - (ADC_RESOLUTION / 2.0)));
+  float rawActivePower = (mean_inst_power / pow(ADC_RESOLUTION, 2)) * pow(VREF, 2) * (V_CAL * I_CAL);
+
+  // --- Correção de fase (Opcional, mas útil) ---
+  rawActivePower *= 1.03; 
+
+  if (rawActivePower < 0) rawActivePower = fabs(rawActivePower);
+
+  // --- Sanitização ---
+  if (isnan(rawActivePower) || isinf(rawActivePower)) rawActivePower = 0;
+  if (isnan(rawVoltage) || isinf(rawVoltage)) rawVoltage = 0;
+  if (isnan(rawCurrent) || isinf(rawCurrent)) rawCurrent = 0;
+
+  // --- Média móvel ---
+  float displayedV, displayedI, displayedP;
+  if (!filterPrimed) {
+    for (int i = 0; i < AVG_SAMPLES; i++) {
+      vHistory[i] = rawVoltage;
+      iHistory[i] = rawCurrent;
+      pHistory[i] = rawActivePower;
+    }
+    vSum = rawVoltage * AVG_SAMPLES;
+    iSum = rawCurrent * AVG_SAMPLES;
+    pSum = rawActivePower * AVG_SAMPLES;
+    filterPrimed = true;
+    displayedV = rawVoltage;
+    displayedI = rawCurrent;
+    displayedP = rawActivePower;
+  } else {
+    vSum -= vHistory[avgIndex];
+    iSum -= iHistory[avgIndex];
+    pSum -= pHistory[avgIndex];
+    vSum += rawVoltage;
+    iSum += rawCurrent;
+    pSum += rawActivePower;
+    vHistory[avgIndex] = rawVoltage;
+    iHistory[avgIndex] = rawCurrent;
+    pHistory[avgIndex] = rawActivePower;
+    displayedV = vSum / AVG_SAMPLES;
+    displayedI = iSum / AVG_SAMPLES;
+    displayedP = pSum / AVG_SAMPLES;
+    avgIndex = (avgIndex + 1) % AVG_SAMPLES;
+  }
+
+  // --- Potências e FP ---
+  
+  // ***** ALTERAÇÃO PRINCIPAL AQUI *****
+  // O limiar deve ser MAIOR que o seu ruído de fundo (~0.7A)
+  const float CURRENT_THRESHOLD = 0.7; // Era 0.2
+  // **********************************
+  
+  float apparentPower, powerFactor, reactivePower;
+
+  if (displayedI < CURRENT_THRESHOLD) {
+    // Se a corrente for apenas ruído (menor que 0.8A), ZERE TUDO.
+    displayedI = 0;
+    displayedP = 0;
+    apparentPower = 0;
+    reactivePower = 0;
+    powerFactor = 0;
+  } else {
+    // Se a corrente for real (maior que 0.8A), calcule
+    apparentPower = displayedV * displayedI;
+    powerFactor = (apparentPower > 0) ? displayedP / apparentPower : 0;
+    powerFactor = constrain(powerFactor, -1.0, 1.0); // Limita entre -1 e 1
+    reactivePower = sqrt(fabs(pow(apparentPower, 2) - pow(displayedP, 2)));
+  }
+
+  // --- Exibição ---
+  displayResults(displayedV, displayedI, displayedP, apparentPower, reactivePower, powerFactor);
+  printToSerial(displayedV, displayedI, displayedP, apparentPower, reactivePower, powerFactor);
+
+  delay(500);
+}
+
+void displayResults(float v, float i, float p_act, float p_app, float p_react, float pf) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+
+  display.print(F("Tensao: ")); display.print(v, 1); display.println(F(" V"));
+  display.print(F("Corrente: ")); display.print(i, 2); display.println(F(" A"));
+  display.println(F("--------------------"));
+  display.print(F("P. Ativa: ")); display.print(p_act, 1); display.println(F(" W"));
+  display.print(F("P. Reativa: ")); display.print(p_act, 1); display.println(F(" VAr"));
+  display.print(F("Fator Pot.: ")); display.print(pf, 2);
+
+  display.display();
+}
+
+void printToSerial(float v, float i, float p_act, float p_app, float p_react, float pf) {
+  Serial.print(F("Tensao: ")); Serial.print(v, 2); Serial.print(F(" V | "));
+  Serial.print(F("Corrente: ")); Serial.print(i, 2); Serial.print(F(" A | "));
+  Serial.print(F("P. Ativa: ")); Serial.print(p_act, 2); Serial.print(F(" W | "));
+  Serial.print(F("P. Reativa: ")); Serial.print(p_act, 2); Serial.print(F(" VAr | "));
+  Serial.print(F("P. Aparente: ")); Serial.print(p_app, 2); Serial.print(F(" VA | "));
+  Serial.print(F("FP: ")); Serial.println(pf, 2);
+}

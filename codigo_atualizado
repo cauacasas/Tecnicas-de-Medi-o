@@ -1,0 +1,129 @@
+#include "EmonLib.h"
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// --- Configurações do Display OLED ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// --- Instância da EmonLib ---
+EnergyMonitor emon1;
+
+// --- SUAS CONSTANTES DE CALIBRAÇÃO (VALIDADAS) ---
+double V_CAL = 270.57625; 
+double I_CAL = 49.82843;
+// Valor final da calibração de fase (o melhor que encontramos)
+double PHASE_CAL = -1.0; 
+
+void setup() {
+  Serial.begin(9600);
+
+  // --- Inicializa o Display OLED ---
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("Falha ao iniciar SSD1306"));
+    for(;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println(F("Medidor de Energia"));
+  display.println(F("Iniciando..."));
+  display.display();
+  delay(1500);
+
+  // --- Inicializa a EmonLib com os valores calibrados ---
+  emon1.voltage(A0, V_CAL, PHASE_CAL); 
+  emon1.current(A1, I_CAL);
+}
+
+void loop() {
+  
+  // Roda o cálculo da EmonLib
+  emon1.calcVI(20, 2000); 
+
+  // --- Pega os resultados ---
+  double v = emon1.Vrms;
+  double i = emon1.Irms;
+  double p_act = emon1.realPower;
+  double apparentPower = emon1.apparentPower; 
+  double pf = emon1.powerFactor; // <-- Valor medido real
+
+  // Calcula Potência Reativa (Q)
+  double p_react;
+  double S_sq = apparentPower * apparentPower;
+  double P_sq = p_act * p_act;
+
+  if (S_sq > P_sq) {
+    p_react = sqrt(S_sq - P_sq);
+  } else {
+    p_react = 0.0;
+  }
+  if (pf < 0) {
+    p_react = -p_react;
+  }
+
+  // --- INÍCIO DA NOVA CONDIÇÃO --- // <-- MUDANÇA AQUI
+  // Se o FP for muito alto (resistivo), força para 1.00 e zera a reativa.
+  // Isso evita o "pisca-pisca" de 0.98 -> 0.99
+  if (pf > 0.98) {
+    pf = 1.00;
+    p_react = 0.00;
+  }
+  // --- FIM DA NOVA CONDIÇÃO ---
+
+  
+  // --- INÍCIO: O seu formato de display ---
+  display.clearDisplay();
+  display.setTextSize(1); 
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+
+  // Linha 1: Tensão
+  display.print(F("Tensao: ")); 
+  display.print(v,1); 
+  display.println(F(" V"));
+
+  // Linha 2: Corrente
+  display.print(F("Corrente: ")); 
+  display.print(i,2); 
+  display.println(F(" A"));
+
+  // Linha 3: Separador
+  display.println(F("--------------------"));
+
+  // Linha 4: Potência Ativa (P)
+  display.print(F("P. Ativa: ")); 
+  display.print(p_act,1); 
+  display.println(F(" W"));
+
+  // Linha 5: Potência Reativa (Q)
+  // (Esta variável já foi forçada para 0.00 se o FP > 0.98)
+  display.print(F("P. Reativa: ")); 
+  display.print(p_react,1); 
+  display.println(F(" VAr"));
+
+  // Linha 6: Fator de Potência (FP)
+  // (Esta variável já foi forçada para 1.00 se o FP > 0.98)
+  display.print(F("Fator Pot.: ")); 
+  display.print(pf,2);
+  
+  // (Opcional) Mostra o tipo de carga (R, I, C)
+  // (Esta lógica agora funciona perfeitamente com a trava)
+  if (pf > 0.98 || pf < -0.98) {
+    display.print(F(" (R)")); 
+  } else if (pf < 0) {
+    display.print(F(" (C)"));
+  } else {
+    display.print(F(" (I)"));
+  }
+
+  // Envia tudo para o display
+  display.display();
+  // --- FIM: O seu formato de display ---
+
+  delay(1000); 
+}
